@@ -1,0 +1,70 @@
+name: Build WiFiRelay
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos (roothide branch) + SDK
+        run: |
+          brew install make xz ldid
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git $HOME/theos
+          git clone --depth 1 --single-branch --filter=blob:none https://github.com/theos/sdks.git $HOME/sdks-tmp
+          mkdir -p $HOME/theos/sdks
+          mv $HOME/sdks-tmp/iPhoneOS14.5.sdk $HOME/theos/sdks/
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+
+      - name: Inspect package
+        run: |
+          python3 - <<'PYEOF'
+          import os, tarfile, io, sys
+          pkgs = [os.path.join('packages', f) for f in os.listdir('packages') if f.endswith('.deb')]
+          assert pkgs, 'no .deb produced!'
+          deb = pkgs[0]
+          print('package:', deb)
+          with open(deb, 'rb') as f:
+              data = f.read()
+          assert data[:8] == b'!<arch>\n', 'not an ar archive'
+          off = 8
+          members = {}
+          while off < len(data):
+              hdr = data[off:off+60]
+              name = hdr[0:16].decode().strip().rstrip('/')
+              size = int(hdr[48:58].decode().strip())
+              body = data[off+60:off+60+size]
+              members[name] = body
+              off += 60 + size + (size % 2)
+          print('members:', list(members))
+          for member, want in (('control.tar.gz', 'control'), ('data.tar.gz', 'data'), ('control.tar.xz', None), ('data.tar.xz', None)):
+              if member in members:
+                  t = tarfile.open(fileobj=io.BytesIO(members[member]))
+                  print(f'--- {member} ---')
+                  for m in t.getmembers():
+                      print(' ', m.name, oct(m.mode))
+                  if want == 'control':
+                      c = t.extractfile('./control') or t.extractfile('control')
+                      print(c.read().decode())
+          arch_ok = False
+          for member in members:
+              if 'data.tar' in member:
+                  t = tarfile.open(fileobj=io.BytesIO(members[member]))
+                  names = t.getnames()
+                  for want_path in ['./usr/bin/WiFiRelayD', './Library/LaunchDaemons/com.corpsezhao.wifirelay.plist']:
+                      ok = any(n.rstrip('/') == want_path.lstrip('./') or n == want_path or n == '.' + want_path for n in names)
+                      print(want_path, 'present:', ok)
+          print('INSPECT-OK')
+          PYEOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifirelay-deb
+          path: packages/*.deb

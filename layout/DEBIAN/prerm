@@ -1,0 +1,12 @@
+#!/bin/sh
+
+launchctl unload /Library/LaunchDaemons/com.corpsezhao.wifirelay.plist 2>/dev/null || true
+
+for p in /sbin/pfctl /usr/sbin/pfctl /usr/libexec/pfctl /bin/pfctl; do
+    if [ -x "$p" ]; then
+        "$p" -q -a com.corpsezhao.wifirelay -F all >/dev/null 2>&1 || true
+        break
+    fi
+done
+
+exit 0

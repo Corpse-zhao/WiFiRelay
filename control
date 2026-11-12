@@ -1,0 +1,9 @@
+Package: com.corpsezhao.wifirelay
+Name: WiFiRelay
+Version: 0.1.0
+Architecture: iphoneos-arm64e
+Description: CarPlay companion: when the phone joins an internet-less hotspot (car head unit / Zlink box), actively probes it and firewalls off dead WiFi so iOS demotes it and cellular takes over automatically. CarPlay local traffic is never touched.
+Maintainer: Corpse-zhao
+Author: Corpse-zhao
+Section: Utilities
+Depends: firmware (>= 14.0)

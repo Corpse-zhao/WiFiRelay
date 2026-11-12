@@ -1,0 +1,22 @@
+#!/bin/sh
+
+mkdir -p /var/mobile/Documents/WiFiRelay
+
+if [ ! -f /var/mobile/Documents/WiFiRelay/config.plist ]; then
+cat > /var/mobile/Documents/WiFiRelay/config.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Enabled</key><true/>
+	<key>ProbeIntervalSec</key><integer>5</integer>
+</dict>
+</plist>
+EOF
+fi
+
+chown -R mobile:mobile /var/mobile/Documents/WiFiRelay 2>/dev/null || true
+
+launchctl load -w /Library/LaunchDaemons/com.corpsezhao.wifirelay.plist 2>/dev/null || true
+
+exit 0
