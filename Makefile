@@ -4,7 +4,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = WiFiRelayD
 WiFiRelayD_FILES = daemon.m
-WiFiRelayD_FRAMEWORKS = Foundation SystemConfiguration
+WiFiRelayD_FRAMEWORKS = Foundation
 WiFiRelayD_CFLAGS = -fobjc-arc
 WiFiRelayD_INSTALL_PATH = /usr/bin
 

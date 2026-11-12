@@ -9,7 +9,8 @@
 // Log:     /var/mobile/Documents/WiFiRelay/relay.log
 
 #import <Foundation/Foundation.h>
-#import <SystemConfiguration/SystemConfiguration.h>
+#import <dlfcn.h>
+#import <dispatch/dispatch.h>
 #import <unistd.h>
 #import <fcntl.h>
 #import <signal.h>
@@ -20,6 +21,8 @@
 #import <errno.h>
 #import <stdarg.h>
 #import <sys/stat.h>
+#import <sys/types.h>
+#import <sys/wait.h>
 #import <sys/ioctl.h>
 #import <sys/filio.h>
 #import <sys/socket.h>
@@ -29,6 +32,11 @@
 #import <arpa/inet.h>
 #import <ifaddrs.h>
 #import <netdb.h>
+
+// Darwin kernel option 25: bind socket to a specific interface
+#ifndef IP_BIND_IF
+#define IP_BIND_IF 25
+#endif
 
 #define WFR_VERSION "0.1.0"
 #define WFR_DIR     "/var/mobile/Documents/WiFiRelay"
@@ -91,6 +99,21 @@ static int cfg_interval(void) {
 
 // ---------- pf ----------
 
+// fork/execl wrapper: pfctl -q -a ANCHOR <a1> <a2>
+static int pfctl_run(const char *a1, const char *a2) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execl(g_pfctlPath, g_pfctlPath, "-q", "-a", WFR_ANCHOR_NAME, a1, a2, (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
 static void find_pfctl(void) {
     static const char *cands[] = { "/sbin/pfctl", "/usr/sbin/pfctl", "/usr/libexec/pfctl", "/bin/pfctl", NULL };
     if (g_pfctlPath[0]) return;
@@ -107,9 +130,7 @@ static void find_pfctl(void) {
 static void clear_anchor(const char *why) {
     if (!g_appliedKey[0]) return;
     if (g_pfctlPath[0]) {
-        char cmd[384];
-        snprintf(cmd, sizeof(cmd), "%s -q -a %s -F all >/dev/null 2>&1", g_pfctlPath, WFR_ANCHOR_NAME);
-        int rc = system(cmd);
+        int rc = pfctl_run("-F", "all");
         wlog("anchor cleared (%s), pfctl rc=%d", why, rc);
     }
     g_appliedKey[0] = 0;
@@ -130,9 +151,7 @@ static void apply_anchor(const char *ifname, const char *subnet) {
         ifname, subnet, ifname);
     fclose(f);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s -q -a %s -f %s >/dev/null 2>&1", g_pfctlPath, WFR_ANCHOR_NAME, WFR_ANCHOR);
-    int rc = system(cmd);
+    int rc = pfctl_run("-f", WFR_ANCHOR);
     if (rc == 0) {
         wlog("anchor APPLIED: block outbound on %s to ! {%s, multicast} (local/CarPlay allowed)", ifname, subnet);
         snprintf(g_appliedKey, sizeof(g_appliedKey), "%s", key);
@@ -232,8 +251,29 @@ static BOOL probe_internet_via(const char *ifname, char *detail, size_t detailLe
 
 // ---------- primary interface helpers ----------
 
+// SCDynamicStore* are marked unavailable in iOS headers but present in the
+// framework binary; load them dynamically.
+static CFTypeRef wfr_sc_copy_global_ipv4(void) {
+    static void *scLib = NULL;
+    static CFTypeRef (*_create)(CFAllocatorRef, CFStringRef, void *, void *) = NULL;
+    static CFTypeRef (*_copyValue)(CFTypeRef, CFStringRef) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        scLib = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_LAZY);
+        if (!scLib) return;
+        _create = (void *)dlsym(scLib, "SCDynamicStoreCreate");
+        _copyValue = (void *)dlsym(scLib, "SCDynamicStoreCopyValue");
+    });
+    if (!_create || !_copyValue) return NULL;
+    CFTypeRef store = _create(NULL, CFSTR("com.corpsezhao.wifirelay"), NULL, NULL);
+    if (!store) return NULL;
+    CFTypeRef val = _copyValue(store, CFSTR("State:/Network/Global/IPv4"));
+    CFRelease(store);
+    return val;
+}
+
 static NSString * primary_interface(NSString **routerOut) {
-    CFDictionaryRef d = SCDynamicStoreCopyValue(NULL, CFSTR("State:/Network/Global/IPv4"));
+    CFDictionaryRef d = (CFDictionaryRef)wfr_sc_copy_global_ipv4();
     if (!d) return nil;
     NSDictionary *dict = (__bridge NSDictionary *)d;
     NSString *pi = dict[@"PrimaryInterface"];
@@ -252,12 +292,11 @@ static BOOL iface_subnet(const char *ifname, char *out, size_t outLen) {
         if (!ia->ifa_addr || strcmp(ia->ifa_name, ifname) != 0) continue;
         if (ia->ifa_addr->sa_family != AF_INET) continue;
         struct sockaddr_in *sa = (struct sockaddr_in *)ia->ifa_addr;
-        struct sockaddr_in *sm = (struct sockaddr_in *)ia->ifa_netmask;
-        char a[64], m[64];
+        char a[64];
         inet_ntop(AF_INET, &sa->sin_addr, a, sizeof(a));
-        inet_ntop(AF_INET, &sm ? &sm->sin_addr : 0, m, sizeof(m));
         int bits = 0;
-        if (sm) {
+        if (ia->ifa_netmask) {
+            struct sockaddr_in *sm = (struct sockaddr_in *)ia->ifa_netmask;
             uint32_t mask = ntohl(sm->sin_addr.s_addr);
             while (mask & 0x80000000u) { bits++; mask <<= 1; }
         }
@@ -298,7 +337,7 @@ int main(int argc, char **argv) {
                 "\t<key>Enabled</key><true/>\n"
                 "\t<key>ProbeIntervalSec</key><integer>5</integer>\n"
                 "</dict>\n</plist>\n";
-            [def writeToFile:@WFR_CFG atomically:YES];
+            [def writeToFile:@WFR_CFG atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             wlog("wrote default config %s", WFR_CFG);
         }
         chown(WFR_DIR, 501, 501);
@@ -323,15 +362,15 @@ int main(int argc, char **argv) {
                     } else {
                         char subnet[64] = {0};
                         if (!iface_subnet(pi.UTF8String, subnet, sizeof(subnet))) {
-                            wlog("primary %@ but no IPv4 addr yet", pi);
+                            wlog("primary %s but no IPv4 addr yet", pi.UTF8String);
                         } else {
                             char detail[1024] = {0};
                             BOOL hasInet = probe_internet_via(pi.UTF8String, detail, sizeof(detail));
                             if (hasInet) {
                                 if (g_appliedKey[0]) clear_anchor("wifi has real internet now");
                             } else {
-                                wlog("no internet on primary %@ (router=%@, subnet=%s): %s",
-                                     pi, router, subnet, detail);
+                                wlog("no internet on primary %s (router=%s, subnet=%s): %s",
+                                     pi.UTF8String, router.UTF8String ?: "nil", subnet, detail);
                                 apply_anchor(pi.UTF8String, subnet);
                             }
                         }
